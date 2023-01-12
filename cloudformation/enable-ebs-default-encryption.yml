@@ -1,0 +1,121 @@
+AWSTemplateFormatVersion: 2010-09-09
+Description: Runbook for security automation
+
+Resources:
+  rRole:
+    Type: AWS::IAM::Role
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: F3
+            reason: "TODO limit policy for logs"
+          - id: W28
+            reason: "Name of role helps identify or associate it to solution"
+    Properties:
+      RoleName: !Sub "automation-role-${AWS::Region}"
+      Description: "Role for Scheduled and Triggered Automation Runbooks"
+      Path: /
+      AssumeRolePolicyDocument:
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - ssm.amazonaws.com
+                - scheduler.amazonaws.com
+                - events.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      Policies:
+        - PolicyName: ssm-automation
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: SSMAutomationExecution
+                Effect: Allow
+                Action:
+                  - "ssm:DescribeAutomationExecutions"
+                  - "ssm:GetAutomationExecution"
+                  - "ssm:StartAutomationExecution"
+                  - "ssm:StopAutomationExecution"
+                Resource:
+                  - !Sub "arn:${AWS::Partition}:ssm:*:${AWS::AccountId}:automation-execution/*"
+                  - !Sub "arn:${AWS::Partition}:ssm:*:${AWS::AccountId}:automation-definition/*:*"
+              - Sid: EBSEnableEncryption
+                Effect: Allow
+                Action:
+                  - "ec2:GetEbsEncryptionByDefault"
+                  - "ec2:EnableEbsEncryptionByDefault"
+                  - "ec2:DisableEbsEncryptionByDefault"
+                Resource: "*"
+      # ManagedPolicyArns:
+      #   - ""
+
+  rDocument:
+    Type: AWS::SSM::Document
+    Properties:
+      DocumentType: Automation
+      Name: enable-ebs-encryption
+      Content:
+        description: Python to Enable EBS Encryption
+        schemaVersion: "0.3"
+        assumeRole: !GetAtt rRole.Arn
+        mainSteps:
+          - name: enable_ebs_encryption
+            description: Enables EBS Encryption in Region
+            action: "aws:executeScript"
+            inputs:
+              Runtime: python3.8
+              Handler: ebs_encryption_handler
+              Script: |-
+                import boto3
+                from botocore.exceptions import ClientError
+                import json
+
+                ec2 = boto3.client("ec2")
+
+                def ebs_encryption_handler(events, context):
+                  res, reason = get_encryption_status()
+                  if reason == "Enabled":
+                    print("EBS Encryption is already enabled")
+                  elif reason == "Disabled":
+                    print("EBS Encryption is disabled. Enabling...")
+                    res, reason = enable_encryption()
+
+                def get_encryption_status():
+                  try:
+                    status = ec2.get_ebs_encryption_by_default()
+                    if status['EbsEncryptionByDefault'] == True:
+                      return (True, "Enabled")
+                    else:
+                      return (False, "Disabled")
+                  except Exception as e:
+                    return (False, str(e))
+
+                def enable_encryption():
+                  try:
+                    status = ec2.enable_ebs_encryption_by_default()
+                    return (True, "Encryption Enabled")
+                  except Exception as e:
+                    return (False, str(e))
+
+                def disable_encryption():
+                  try:
+                    response = ec2.disable_ebs_encryption_by_default()
+                    return (True, "Encryption Disabled")
+                  except Exception as e:
+                    return (False, str(e))
+
+  rSchedule:
+    Type: AWS::Scheduler::Schedule
+    Properties:
+      Name: ebs-encryption
+      Description: Schedule the re-enabling of Default EBS Encryption
+      FlexibleTimeWindow:
+        Mode: "OFF"
+      ScheduleExpression: rate(24 hours)
+      ScheduleExpressionTimezone: US/Central
+      State: ENABLED
+      Target:
+        Arn: !Sub arn:${AWS::Partition}:scheduler:::aws-sdk:ssm:startAutomationExecution
+        Input: '{"DocumentName": "enable-ebs-encryption"}'
+        RoleArn: !GetAtt rRole.Arn
